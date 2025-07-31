@@ -1,0 +1,752 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, query, onSnapshot, addDoc, doc, updateDoc, setDoc, serverTimestamp, getDoc } from 'firebase/firestore'; // Added getDoc and setDoc
+
+// --- Firebase Configuration ---
+// These global variables are provided by the Canvas environment.
+// DO NOT modify these or prompt the user for them.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+// Corrected typo: __initialAuthToken should be __initial_auth_token
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null; 
+
+// --- Helper Components ---
+
+// LoadingSpinner Component
+const LoadingSpinner = () => (
+  <div className="flex justify-center items-center py-4">
+    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+  </div>
+);
+
+// MessageBox Component (replaces alert/confirm)
+const MessageBox = ({ message, type, onClose }) => {
+  if (!message) return null;
+
+  let bgColor = 'bg-blue-500';
+  if (type === 'error') bgColor = 'bg-red-500';
+  if (type === 'success') bgColor = 'bg-green-500';
+  if (type === 'warning') bgColor = 'bg-yellow-500';
+
+  return (
+    <div className={`fixed top-4 right-4 ${bgColor} text-white px-6 py-3 rounded-lg shadow-lg z-50 flex items-center justify-between`}>
+      <span>{message}</span>
+      <button onClick={onClose} className="ml-4 text-white font-bold text-xl leading-none">&times;</button>
+    </div>
+  );
+};
+
+// --- Main Application Component ---
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [recipes, setRecipes] = useState([]);
+  const [popularRecipes, setPopularRecipes] = useState([]); // For displaying popular/recent recipes
+  const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState({ text: '', type: '' });
+  const [viewMode, setViewMode] = useState('list'); // 'list', 'add', 'edit', 'detail', 'profile'
+  const [selectedRecipe, setSelectedRecipe] = useState(null); // For detail view or editing
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // Initialize Firebase and authenticate
+  useEffect(() => {
+    const app = initializeApp(firebaseConfig);
+    const firestore = getFirestore(app);
+    const firebaseAuth = getAuth(app);
+
+    setDb(firestore);
+    setAuth(firebaseAuth);
+
+    const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+          } else {
+            await signInAnonymously(firebaseAuth);
+          }
+        } catch (error) {
+          console.error("Firebase authentication error:", error);
+          setMessage({ text: 'Authentication failed. Please try again.', type: 'error' });
+        }
+      }
+      setLoading(false);
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  // Fetch all recipes and popular recipes from Firestore
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    setLoading(true);
+    const recipesCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/recipes`);
+
+    // Fetch all recipes for the main list and search
+    const unsubscribeAll = onSnapshot(recipesCollectionRef, (snapshot) => {
+      const fetchedRecipes = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setRecipes(fetchedRecipes);
+      setLoading(false);
+    }, (error) => {
+      console.error("Error fetching all recipes:", error);
+      setMessage({ text: 'Failed to load recipes. Please refresh.', type: 'error' });
+      setLoading(false);
+    });
+
+    // Fetch popular recipes (e.g., most recent 3)
+    const unsubscribePopular = onSnapshot(recipesCollectionRef, (snapshot) => {
+        const fetchedPopularRecipes = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+        })).sort((a, b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0)).slice(0, 3); // Sort by createdAt and take top 3
+        setPopularRecipes(fetchedPopularRecipes);
+    }, (error) => {
+        console.error("Error fetching popular recipes:", error);
+    });
+
+
+    return () => {
+      unsubscribeAll();
+      unsubscribePopular();
+    };
+  }, [db, userId]);
+
+  // Handle adding a new recipe or updating an existing one
+  const handleSaveRecipe = async (recipeData) => {
+    if (!db || !userId) {
+      setMessage({ text: 'Application not ready. Please wait.', type: 'error' });
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const recipesCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/recipes`);
+      if (selectedRecipe && viewMode === 'edit') {
+        // Update existing recipe
+        const recipeDocRef = doc(db, `artifacts/${appId}/users/${userId}/recipes`, selectedRecipe.id);
+        await updateDoc(recipeDocRef, {
+          ...recipeData,
+          updatedAt: serverTimestamp()
+        });
+        setMessage({ text: 'Recipe updated successfully!', type: 'success' });
+      } else {
+        // Add new recipe
+        await addDoc(recipesCollectionRef, {
+          ...recipeData,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+        setMessage({ text: 'Recipe added successfully!', type: 'success' });
+      }
+      setViewMode('list'); // Go back to list view
+      setSelectedRecipe(null); // Clear selected recipe
+    } catch (error) {
+      console.error("Error saving recipe:", error);
+      setMessage({ text: `Failed to save recipe: ${error.message}`, type: 'error' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Handle deleting a recipe
+  const handleDeleteRecipe = async (recipeId) => {
+    if (!db || !userId) {
+      setMessage({ text: 'Application not ready. Please wait.', type: 'error' });
+      return;
+    }
+
+    const confirmDelete = window.confirm("Are you sure you want to delete this recipe?");
+    if (!confirmDelete) return;
+
+    setLoading(true);
+    try {
+      const recipeDocRef = doc(db, `artifacts/${appId}/users/${userId}/recipes`, recipeId);
+      await deleteDoc(recipeDocRef);
+      setMessage({ text: 'Recipe deleted successfully!', type: 'success' });
+    } catch (error) {
+      console.error("Error deleting recipe:", error);
+      setMessage({ text: `Failed to delete recipe: ${error.message}`, type: 'error' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Handle editing a recipe
+  const handleEditClick = (recipe) => {
+    setSelectedRecipe(recipe);
+    setViewMode('edit');
+  };
+
+  // Handle viewing recipe details
+  const handleViewDetails = (recipe) => {
+    setSelectedRecipe(recipe);
+    setViewMode('detail');
+  };
+
+  // Filter recipes for search
+  const filteredRecipes = recipes.filter(recipe =>
+    recipe.recipeName.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  // Close message box
+  const handleCloseMessage = useCallback(() => {
+    setMessage({ text: '', type: '' });
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-purple-100 to-blue-200 p-4 font-inter text-gray-800">
+      <MessageBox message={message.text} type={message.type} onClose={handleCloseMessage} />
+
+      <header className="bg-white rounded-xl shadow-lg p-6 mb-8 text-center">
+        <h1 className="text-4xl font-extrabold text-purple-700 mb-2">The Flavor Book</h1>
+        <div className="flex justify-center space-x-4 mt-4">
+          <button
+            onClick={() => setViewMode('list')}
+            className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-full shadow-md transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-purple-300"
+          >
+            Recipes
+          </button>
+          <button
+            onClick={() => setViewMode('profile')}
+            className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-full shadow-md transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-purple-300"
+          >
+            My Profile
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto">
+        <div className="flex justify-between items-center mb-6">
+          <h2 className="text-3xl font-bold text-purple-600">
+            {viewMode === 'add' ? 'Add New Recipe' :
+             viewMode === 'edit' ? 'Edit Recipe' :
+             viewMode === 'detail' ? 'Recipe Details' :
+             viewMode === 'profile' ? 'My Profile' : 'Your Recipes'}
+          </h2>
+          {viewMode === 'list' && (
+            <button
+              onClick={() => setViewMode('add')}
+              className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-6 rounded-full shadow-lg transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-purple-300"
+            >
+              Add New Recipe
+            </button>
+          )}
+          {(viewMode === 'add' || viewMode === 'edit' || viewMode === 'detail' || viewMode === 'profile') && (
+            <button
+              onClick={() => {
+                setViewMode('list');
+                setSelectedRecipe(null);
+              }}
+              className="bg-gray-500 hover:bg-gray-600 text-white font-bold py-3 px-6 rounded-full shadow-lg transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-gray-300"
+            >
+              Back to Recipes
+            </button>
+          )}
+        </div>
+
+        {loading && <LoadingSpinner />}
+
+        {!loading && (viewMode === 'add' || viewMode === 'edit') && (
+          <RecipeForm
+            onSave={handleSaveRecipe}
+            initialData={selectedRecipe}
+            onCancel={() => {
+              setViewMode('list');
+              setSelectedRecipe(null);
+            }}
+            setMessage={setMessage}
+          />
+        )}
+
+        {!loading && viewMode === 'detail' && selectedRecipe && (
+          <RecipeDetail
+            recipe={selectedRecipe}
+            onBack={() => {
+              setViewMode('list');
+              setSelectedRecipe(null);
+            }}
+            onEdit={() => handleEditClick(selectedRecipe)}
+            onDelete={() => handleDeleteRecipe(selectedRecipe.id)}
+          />
+        )}
+
+        {!loading && viewMode === 'profile' && (
+          <ProfilePage userId={userId} db={db} appId={appId} setMessage={setMessage} />
+        )}
+
+        {!loading && viewMode === 'list' && (
+          <>
+            {/* Search Bar */}
+            <div className="mb-6">
+              <input
+                type="text"
+                placeholder="Search recipes by name..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-lg"
+              />
+            </div>
+
+            {/* Popular Recipes Section */}
+            {popularRecipes.length > 0 && (
+              <section className="mb-8">
+                <h3 className="text-2xl font-bold text-purple-600 mb-4">Popular Recipes</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {popularRecipes.map((recipe) => (
+                    <RecipeCard key={recipe.id} recipe={recipe} onViewDetails={handleViewDetails} />
+                  ))}
+                </div>
+                <hr className="my-8 border-t-2 border-purple-200" />
+              </section>
+            )}
+
+            {/* All Recipes List */}
+            {filteredRecipes.length > 0 && ( // Only show heading if there are filtered recipes
+              <h3 className="text-2xl font-bold text-purple-600 mb-4">All Recipes</h3>
+            )}
+            <RecipeList recipes={filteredRecipes} onDelete={handleDeleteRecipe} onEdit={handleEditClick} onViewDetails={handleViewDetails} />
+            {filteredRecipes.length === 0 && searchTerm === '' && (
+              <div className="bg-white rounded-xl shadow-lg p-8 text-center text-gray-600">
+                <p className="text-xl mb-4">No recipes added yet!</p>
+                <p>Click "Add New Recipe" to get started.</p>
+              </div>
+            )}
+            {filteredRecipes.length === 0 && searchTerm !== '' && (
+              <div className="bg-white rounded-xl shadow-lg p-8 text-center text-gray-600">
+                <p className="text-xl mb-4">No recipes found matching "{searchTerm}"!</p>
+                <p>Try a different search term or add a new recipe.</p>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  );
+};
+
+// --- RecipeForm Component ---
+const RecipeForm = ({ onSave, initialData, onCancel, setMessage }) => {
+  const [recipeName, setRecipeName] = useState(initialData?.recipeName || '');
+  const [ingredients, setIngredients] = useState(initialData?.ingredients?.join('\n') || '');
+  const [process, setProcess] = useState(initialData?.process || '');
+  const [timeTaken, setTimeTaken] = useState(initialData?.timeTaken || '');
+  const [photoData, setPhotoData] = useState(initialData?.photoData || ''); // Stores Base64 string
+  const [imagePreview, setImagePreview] = useState(initialData?.photoData || ''); // For displaying preview
+  // Removed videoUrl state
+
+  useEffect(() => {
+    if (initialData) {
+      setRecipeName(initialData.recipeName || '');
+      setIngredients(initialData.ingredients?.join('\n') || '');
+      setProcess(initialData.process || '');
+      setTimeTaken(initialData.timeTaken || '');
+      setPhotoData(initialData.photoData || '');
+      setImagePreview(initialData.photoData || '');
+      // Removed setVideoUrl
+    } else {
+      // Reset form when adding a new recipe
+      setRecipeName('');
+      setIngredients('');
+      setProcess('');
+      setTimeTaken('');
+      setPhotoData('');
+      setImagePreview('');
+      // Removed setVideoUrl
+    }
+  }, [initialData]);
+
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024; // 1MB
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        setMessage({ text: "Image file is too large! Please select an image smaller than 1MB.", type: 'warning' });
+        e.target.value = ''; // Clear the input
+        setPhotoData('');
+        setImagePreview('');
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setPhotoData(reader.result); // This will be the Base64 string
+        setImagePreview(reader.result);
+        setMessage({ text: "Image loaded successfully!", type: 'success' });
+      };
+      reader.onerror = (error) => {
+        console.error("Error reading file:", error);
+        setMessage({ text: "Failed to read image file. Please try another image.", type: 'error' });
+        setPhotoData('');
+        setImagePreview('');
+      };
+      reader.readAsDataURL(file);
+    } else {
+      setPhotoData('');
+      setImagePreview('');
+    }
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const recipeData = {
+      recipeName,
+      ingredients: ingredients.split('\n').filter(line => line.trim() !== ''),
+      process,
+      timeTaken,
+      photoData: photoData, // Storing Base64 string
+      // Removed videoUrl from recipeData
+    };
+    onSave(recipeData);
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow-lg p-8 mb-8 space-y-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div>
+          <label htmlFor="recipeName" className="block text-sm font-medium text-gray-700 mb-1">Recipe Name</label>
+          <input
+            type="text"
+            id="recipeName"
+            value={recipeName}
+            onChange={(e) => setRecipeName(e.target.value)}
+            className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+            placeholder="e.g., Classic Lasagna"
+            required
+          />
+        </div>
+        <div>
+          <label htmlFor="timeTaken" className="block text-sm font-medium text-gray-700 mb-1">Time Taken</label>
+          <input
+            type="text"
+            id="timeTaken"
+            value={timeTaken}
+            onChange={(e) => setTimeTaken(e.target.value)}
+            className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+            placeholder="e.g., 1 hour 30 minutes"
+            required
+          />
+        </div>
+      </div>
+
+      <div>
+        <label htmlFor="ingredients" className="block text-sm font-medium text-gray-700 mb-1">Ingredients (one per line)</label>
+        <textarea
+          id="ingredients"
+          value={ingredients}
+          onChange={(e) => setIngredients(e.target.value)}
+          rows="6"
+          className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+          placeholder="e.g.,&#10;2 cups all-purpose flour&#10;1 tsp baking powder&#10;1/2 tsp salt"
+          required
+        ></textarea>
+      </div>
+
+      <div>
+        <label htmlFor="process" className="block text-sm font-medium text-gray-700 mb-1">Process / Instructions</label>
+        <textarea
+          id="process"
+          value={process}
+          onChange={(e) => setProcess(e.target.value)}
+          rows="8"
+          className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+          placeholder="e.g.,&#10;1. Preheat oven to 375°F (190°C).&#10;2. In a large bowl, whisk together flour, baking powder, and salt."
+          required
+        ></textarea>
+      </div>
+
+      <div>
+        <label htmlFor="photoUpload" className="block text-sm font-medium text-gray-700 mb-1">Upload Food Photo (Max 1MB)</label>
+        <input
+          type="file"
+          id="photoUpload"
+          accept="image/*"
+          onChange={handleFileChange}
+          className="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-purple-50 file:text-purple-700 hover:file:bg-purple-100"
+        />
+        {imagePreview && (
+          <div className="mt-4">
+            <p className="text-sm font-medium text-gray-700 mb-2">Image Preview:</p>
+            <img src={imagePreview} alt="Recipe Preview" className="max-w-xs h-auto rounded-lg shadow-md border border-gray-200" />
+          </div>
+        )}
+        <p className="mt-2 text-xs text-gray-500">
+          Images are stored directly with the recipe data (Base64). For very large images or many images,
+          a dedicated storage service like Firebase Storage would be more efficient.
+        </p>
+      </div>
+
+      {/* Removed Video URL input field and its associated text */}
+
+      <div className="flex justify-end space-x-4">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="px-6 py-3 border border-gray-300 rounded-full shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 transition duration-150 ease-in-out"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          className="px-6 py-3 border border-transparent rounded-full shadow-sm text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 transition duration-150 ease-in-out"
+        >
+          {initialData ? 'Update Recipe' : 'Add Recipe'}
+        </button>
+      </div>
+    </form>
+  );
+};
+
+// --- RecipeCard Component (for list view) ---
+const RecipeCard = ({ recipe, onViewDetails }) => {
+  return (
+    <div className="bg-white rounded-xl shadow-lg overflow-hidden flex flex-col">
+      <div className="relative w-full h-48 bg-gray-200">
+        {recipe.photoData ? (
+          <img
+            src={recipe.photoData}
+            alt={recipe.recipeName}
+            className="w-full h-full object-cover"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center bg-gray-300 text-gray-600 text-center">
+            No Image
+          </div>
+        )}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent"></div>
+        <h3 className="absolute bottom-4 left-4 text-white text-2xl font-bold">{recipe.recipeName}</h3>
+      </div>
+      <div className="p-6 flex-grow">
+        <div className="mb-4">
+          <h4 className="font-semibold text-purple-600 mb-1">Time Taken:</h4>
+          <p className="text-gray-700">{recipe.timeTaken}</p>
+        </div>
+        <div className="mb-4">
+          <h4 className="font-semibold text-purple-600 mb-1">Ingredients:</h4>
+          <ul className="list-disc list-inside text-gray-700 text-sm">
+            {recipe.ingredients.slice(0, 3).map((item, index) => (
+              <li key={index}>{item}</li>
+            ))}
+            {recipe.ingredients.length > 3 && (
+              <li className="font-semibold">...and {recipe.ingredients.length - 3} more</li>
+            )}
+          </ul>
+        </div>
+        <div>
+          <h4 className="font-semibold text-purple-600 mb-1">Process (Excerpt):</h4>
+          <p className="text-gray-700 text-sm line-clamp-3">{recipe.process}</p>
+        </div>
+      </div>
+      <div className="p-6 border-t border-gray-100 flex justify-end">
+        <button
+          onClick={() => onViewDetails(recipe)}
+          className="bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-full text-sm shadow transition duration-200 ease-in-out transform hover:scale-105"
+        >
+          View Details
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// --- RecipeList Component ---
+const RecipeList = ({ recipes, onDelete, onEdit, onViewDetails }) => {
+  if (recipes.length === 0) {
+    return (
+      <div className="bg-white rounded-xl shadow-lg p-8 text-center text-gray-600">
+        <p className="text-xl mb-4">No recipes found matching your search!</p>
+        <p>Try a different search term or add a new recipe.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      {recipes.map((recipe) => (
+        <RecipeCard key={recipe.id} recipe={recipe} onViewDetails={onViewDetails} />
+      ))}
+    </div>
+  );
+};
+
+// --- RecipeDetail Component ---
+const RecipeDetail = ({ recipe, onBack, onEdit, onDelete }) => {
+  // Removed getEmbedUrl function as video is no longer supported
+
+  return (
+    <div className="bg-white rounded-xl shadow-lg p-8 mb-8">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-4xl font-extrabold text-purple-700">{recipe.recipeName}</h2>
+        <div className="flex space-x-3">
+          <button
+            onClick={onEdit}
+            className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-full text-sm shadow transition duration-200 ease-in-out transform hover:scale-105"
+          >
+            Edit
+          </button>
+          <button
+            onClick={onDelete}
+            className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-full text-sm shadow transition duration-200 ease-in-out transform hover:scale-105"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+
+      {recipe.photoData && (
+        <div className="mb-6 rounded-lg overflow-hidden shadow-md">
+          <img
+            src={recipe.photoData}
+            alt={recipe.recipeName}
+            className="w-full h-auto object-cover max-h-96"
+          />
+        </div>
+      )}
+
+      {/* Removed Video embed section */}
+
+      <div className="mb-6">
+        <h3 className="text-2xl font-bold text-purple-600 mb-3">Time Taken</h3>
+        <p className="text-lg text-gray-700">{recipe.timeTaken}</p>
+      </div>
+
+      <div className="mb-6">
+        <h3 className="text-2xl font-bold text-purple-600 mb-3">Ingredients</h3>
+        <ul className="list-disc list-inside text-lg text-gray-700 space-y-1">
+          {recipe.ingredients.map((item, index) => (
+            <li key={index}>{item}</li>
+          ))}
+        </ul>
+      </div>
+
+      <div className="mb-6">
+        <h3 className="text-2xl font-bold text-purple-600 mb-3">Process / Instructions</h3>
+        <p className="text-lg text-gray-700 whitespace-pre-wrap">{recipe.process}</p>
+      </div>
+
+      <div className="flex justify-end mt-8">
+        <button
+          onClick={onBack}
+          className="bg-gray-500 hover:bg-gray-600 text-white font-bold py-3 px-6 rounded-full shadow-lg transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-gray-300"
+        >
+          Back to All Recipes
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// --- ProfilePage Component ---
+const ProfilePage = ({ userId, db, appId, setMessage }) => {
+  const [userName, setUserName] = useState('');
+  const [userBio, setUserBio] = useState('');
+  const [profileLoading, setProfileLoading] = useState(true);
+
+  // Path to the user's profile document
+  const profileDocRef = userId ? doc(db, `artifacts/${appId}/users/${userId}/profile/user_data`) : null;
+
+  // Fetch user profile data
+  useEffect(() => {
+    if (!profileDocRef) {
+      setProfileLoading(false);
+      return;
+    }
+
+    const fetchProfile = async () => {
+      try {
+        const docSnap = await getDoc(profileDocRef);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setUserName(data.name || '');
+          setUserBio(data.bio || '');
+        }
+      } catch (error) {
+        console.error("Error fetching profile:", error);
+        setMessage({ text: 'Failed to load profile data.', type: 'error' });
+      } finally {
+        setProfileLoading(false);
+      }
+    };
+
+    fetchProfile();
+  }, [profileDocRef, setMessage]);
+
+  const handleSaveProfile = async (e) => {
+    e.preventDefault();
+    if (!profileDocRef) {
+      setMessage({ text: 'User not authenticated. Cannot save profile.', type: 'error' });
+      return;
+    }
+
+    setProfileLoading(true);
+    try {
+      await setDoc(profileDocRef, {
+        name: userName,
+        bio: userBio,
+        updatedAt: serverTimestamp()
+      }, { merge: true }); // Use merge to avoid overwriting other fields if they exist
+      setMessage({ text: 'Profile saved successfully!', type: 'success' });
+    } catch (error) {
+      console.error("Error saving profile:", error);
+      setMessage({ text: `Failed to save profile: ${error.message}`, type: 'error' });
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
+  if (profileLoading) {
+    return <LoadingSpinner />;
+  }
+
+  return (
+    <div className="bg-white rounded-xl shadow-lg p-8 mb-8">
+      <h3 className="text-3xl font-bold text-purple-600 mb-4">Edit Your Profile</h3>
+      <form onSubmit={handleSaveProfile} className="space-y-6">
+        <div>
+          <label htmlFor="userName" className="block text-sm font-medium text-gray-700 mb-1">Your Name</label>
+          <input
+            type="text"
+            id="userName"
+            value={userName}
+            onChange={(e) => setUserName(e.target.value)}
+            className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+            placeholder="e.g., Jane Doe"
+          />
+        </div>
+        <div>
+          <label htmlFor="userBio" className="block text-sm font-medium text-gray-700 mb-1">About You</label>
+          <textarea
+            id="userBio"
+            value={userBio}
+            onChange={(e) => setUserBio(e.target.value)}
+            rows="5"
+            className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 sm:text-sm"
+            placeholder="Tell us a little about yourself, your cooking style, etc."
+          ></textarea>
+        </div>
+        <div className="flex justify-end">
+          <button
+            type="submit"
+            className="px-6 py-3 border border-transparent rounded-full shadow-sm text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 transition duration-150 ease-in-out"
+          >
+            Save Profile
+          </button>
+        </div>
+      </form>
+      {userId && (
+        <p className="text-sm text-gray-500 mt-6">
+          Your unique identifier: <span className="font-mono bg-gray-100 px-2 py-1 rounded-md text-xs">{userId}</span>
+        </p>
+      )}
+    </div>
+  );
+};
+
+export default App;
